@@ -181,7 +181,7 @@ window.__mpReady=window.__MP.ready;
   /* 10단위 정렬 전용 그리드 레이아웃 */
   .roundgrid{display:grid;grid-template-columns:repeat(10, minmax(0, 1fr));gap:5px;width:100%;max-width:540px;padding:2px;flex-shrink:1;overflow:hidden}
   .roundgrid button{padding:6px 0;font-size:18px;font-weight:700;border-radius:6px;width:100%}
-  .roundgrid button.r5{background:var(--blue);color:#fff}
+  .roundgrid button.r10{background:var(--blue);color:#fff}
   .skinrow{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;max-width:540px;flex-shrink:0}
   .skinrow .skin{padding:6px 12px;font-size:17.25px;border-radius:99px;border:1px solid var(--border);background:var(--panel);color:#fff;display:flex;gap:5px;align-items:center}
   .skinrow .skin.sel{outline:2px solid var(--primary)}
@@ -383,7 +383,7 @@ window.__mpReady=window.__MP.ready;
           <li><b>😈 10 라운드:</b> 속도 증가 및 보스 특수 패턴 강화.</li>
         </ul>
       </div>
-      <div id="soundNotice" class="sound-notice">🔊 음성으로 명령이 나옵니다. 볼륨을 올리고 시작하세요.<br> 본 서비스는 현재 iOS 운영 체제만을 지원하는 상태입니다.</div>
+      <div id="soundNotice" class="sound-notice">🔊 음성으로 명령이 나옵니다. 볼륨을 올리고 시작하세요.<br> 본 서비스는 현재 PC와 IOS 운영 체제만을 지원합니다.</div>
       <div class="btnrow">
         <button id="startBtn" disabled>모델 로딩 중…</button>
       </div>
@@ -425,7 +425,6 @@ window.__mpReady=window.__MP.ready;
 const STR={
   hudTask:(n)=>`WAVE ${Math.min(n,10)}/10`,
   hudAcc:(p)=>`SUCCESS ${p}%`,
-  confirmQuit:"진행 중인 게임을 종료하고 난이도 설정으로 이동할까요?",
   confirmEnd:"진행 중인 게임을 종료할까요?",
   cam:{
     NO_API:"카메라 API 가용성 확보 실패. 최신 브라우저를 권장합니다.",
@@ -534,7 +533,7 @@ const state={
   cmdStartTs:0, cmdDeadline:0, firstCorrectTs:0,
   /* [#13] 무한 누적 배열 제거 → 러닝 집계 */
   reactionSum:0, reactionN:0, totalCmds:0, totalCorrect:0,
-  bestScore:0, startedAt:1,
+  bestScore:0,
   lives:LIVES_START, combo:0, maxCombo:0,
   roundType:"normal", roundMul:1,
   xp:0, nick:"Player",
@@ -674,8 +673,6 @@ function loadXP(){ const n=safeGet(XP_KEY,0); return (typeof n==="number"&&n>=0)
 function saveXP(n){ safeSet(XP_KEY,n); }
 /* 닉네임은 NICK_KEY 에만, 스킨은 SKIN_KEY 에만 저장(이전: 함수명 혼동으로 스킨이 닉네임을 덮어씀) */
 function loadNick(){ const s=safeGet(NICK_KEY,"Player"); const v=(typeof s==="string"&&s.trim())?s.trim().slice(0,10):"Player"; return v.replace(/[<>"'&]/g,""); }
-function saveNick(s){ safeSet(NICK_KEY, String(s).replace(/[<>"'&]/g,"").trim().slice(0,10)); }
-function loadSkinId(){ const s=safeGet(SKIN_KEY,"classic"); return SKINS.some(x=>x.id===s)?s:"classic"; }
 function saveSkin(id){ if(SKINS.some(x=>x.id===id)) safeSet(SKIN_KEY, id); }
 function saveStyle(s){ safeSet(STYLE_KEY,s); }
 function loadStyle(){ const s=safeGet(STYLE_KEY,"original"); return isStyle(s)?s:"original"; }
@@ -704,7 +701,7 @@ const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platfo
 /* [수정#8/끊김] 모바일 공용 플래그 — DPR 상한·파티클·그림자·모델복잡도 적응에 사용 */
 const IS_MOBILE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (("ontouchstart" in window) && Math.min(screen.width,screen.height)<820);
 let koVoice=null, ttsReady=false, ttsUnlocked=false, _voicePollT=0, _voicePolls=0;
-let _ttsWatchdog=0, _ttsRetryT=0;
+let _ttsWatchdog=0, _ttsRetryT=0, _ttsGen=0;   /* [FIX-TTS] 발화 세대 토큰: 새 발화/정지 시 증가 → 이전 발화의 onerror/워치독/재시도를 전부 무효화(겹침·잔존 음성 차단) */
 
 /* [요청6,7] 한국어 보이스 선별: 로컬(오프라인) 우선 → 발음 안정·지연 최소. */
 function pickKoVoice(vs){
@@ -751,45 +748,62 @@ function unlockTTS(){
   }catch{}
 }
 
-/* [요청6,7] 핵심 발화 함수 — 무조건 소리가 나도록 다중 안전장치:
-   1) cancel→resume(끊김 버그 회피)  2) onerror/무발화 워치독 자동 재시도
-   3) pitch/volume 고정으로 발음 명료도 확보 */
+/* [요청6,7][FIX-TTS] 핵심 발화 함수.
+   기존 버그 원인:
+   (A) 새 명령이 speak()→synth.cancel() 하면 '이전 발화'의 onerror가 비동기로 발생,
+       그 핸들러가 attempt<2 조건으로 '이전 명령 텍스트'를 다시 재생(fire) → 현재 발화를
+       또 cancel → 시작음절 반복("배배배백기 올려") + 음성 겹침.
+   (B) 라운드 종료 시 stopSpeak()의 cancel 도 동일 경로로 onerror 재시도를 유발 →
+       결과 화면에서 뒤늦게 음성이 다시 나옴.
+   해결:
+   1) 발화마다 세대(gen) 부여. 모든 콜백은 gen!==_ttsGen 이면 즉시 폐기.
+   2) onerror 의 사유가 'interrupted/canceled'(=의도적 취소)면 재시도 금지.
+   3) 재시도는 최대 1회로 축소하고, 워치독은 synth.pending 까지 확인. */
 function speak(text, rate){
   if(!TTS_SUPPORTED || !text) return;
   const synth=window.speechSynthesis;
+  const gen=++_ttsGen;                          // 새 발화 세대 → 이전 콜백 전부 무효화
   clearTimeout(_ttsRetryT); clearTimeout(_ttsWatchdog);
+  try{ synth.cancel(); }catch{}                 // 이전 발화 1회만 취소(재시도 시엔 취소 안 함)
 
   const fire=(attempt)=>{
+    if(gen!==_ttsGen) return;                   // 더 새로운 발화/정지 발생 → 이 세대 폐기
     try{
-      synth.cancel();                       // 이전 발화 제거
-      if(synth.paused) synth.resume();       // 일부 브라우저 paused 고착 해제
+      if(synth.paused){ try{ synth.resume(); }catch{} }
       const u=new SpeechSynthesisUtterance(String(text));
       u.lang="ko-KR";
       if(koVoice) u.voice=koVoice;
       u.rate=Math.max(0.6, Math.min(rate||1.05, 2.0));
-      u.pitch=1.0;                           // 발음 명료도(과한 피치 변형 금지)
-      u.volume=1.0;                          // 항상 최대 볼륨
+      u.pitch=1.0;                              // 발음 명료도(과한 피치 변형 금지)
+      u.volume=1.0;                             // 항상 최대 볼륨
       let started=false;
       u.onstart=()=>{ started=true; clearTimeout(_ttsWatchdog); };
-      u.onerror=()=>{
-        if(attempt<2){ _ttsRetryT=setTimeout(()=>fire(attempt+1), 120); }
+      u.onend  =()=>{ clearTimeout(_ttsWatchdog); };
+      u.onerror=(e)=>{
+        clearTimeout(_ttsWatchdog);
+        const reason=(e&&e.error)||"";
+        /* 의도적 취소 또는 세대 교체 → 재시도 금지(겹침/잔존 음성 차단) */
+        if(gen!==_ttsGen || reason==="interrupted" || reason==="canceled" || reason==="not-allowed") return;
+        if(attempt<1){ _ttsRetryT=setTimeout(()=>fire(attempt+1), 160); }
       };
       synth.speak(u);
-      /* 워치독: 500ms 내 발화가 시작되지 않으면(무음 의심) 1회 재시도.
-         synth.speaking 교차 확인으로 정상 발화 중 오재시도 방지. */
+      /* 워치독: 700ms 내 발화 미시작 + 큐(pending)·재생(speaking) 모두 비어있으면
+         '무음'으로 보고 1회만 재시도. 같은 세대에서만 동작. */
       _ttsWatchdog=setTimeout(()=>{
-        if(!started && !synth.speaking && attempt<2){ fire(attempt+1); }
-      }, 500);
+        if(gen!==_ttsGen) return;
+        if(!started && !synth.speaking && !synth.pending && attempt<1){ fire(attempt+1); }
+      }, 700);
     }catch{
-      if(attempt<2) _ttsRetryT=setTimeout(()=>fire(attempt+1), 120);
+      if(gen===_ttsGen && attempt<1) _ttsRetryT=setTimeout(()=>fire(attempt+1), 160);
     }
   };
   fire(0);
 }
-/* [FIX#2/#3] 발화 완전 정지: 합성 취소 + 재시도/워치독 타이머 제거.
-   일시정지·탭전환·라운드 종료·게임오버 시 호출해 '스테일 음성'이 결과 화면에서
-   뒤늦게 재생되는 문제를 차단한다. */
+/* [FIX-TTS] 발화 완전 정지: 세대 증가 → 진행 중 발화의 cancel-onerror 가 재시도로
+   '되살아나' 결과/일시정지 화면에서 음성이 재생되는 문제를 원천 차단한다.
+   (일시정지·탭전환·라운드 종료·게임오버·홈 이동 시 호출) */
 function stopSpeak(){
+  _ttsGen++;                                   // 모든 대기 콜백/재시도 무효화
   clearTimeout(_ttsRetryT); clearTimeout(_ttsWatchdog);
   if(TTS_SUPPORTED){ try{ window.speechSynthesis.cancel(); }catch{} }
 }
@@ -856,7 +870,7 @@ function showRoundSelect(){
   if(!roundGrid.childElementCount){
     for(let r=1;r<=ROUNDS;r++){
       const b=document.createElement("button");
-      b.textContent=r; if(r%10===0) b.classList.add("r5");
+      b.textContent=r; if(r%10===0) b.classList.add("r10");
       b.addEventListener("click",()=>beginGameAt(r,"normal"));
       roundGrid.appendChild(b);
     }
@@ -920,7 +934,7 @@ function beginGameAt(r, mode){
   state.mode=mode||"normal";
   Object.assign(state,{
     score:0, round:0, command:null, lastResult:null, target:{...INITIAL_POSE},
-    reactionSum:0, reactionN:0, totalCmds:0, totalCorrect:0, roundTotal:0, roundCorrect:0, startedAt:r,
+    reactionSum:0, reactionN:0, totalCmds:0, totalCorrect:0, roundTotal:0, roundCorrect:0,
     lives:LIVES_START, combo:0, maxCombo:0, paused:false, pausedAt:0, userPaused:false,
   });
 
